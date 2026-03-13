@@ -51,6 +51,11 @@
 #define SDIO_D2 sd_card_p->sdio_if_p->D2_gpio
 #define SDIO_D3 sd_card_p->sdio_if_p->D3_gpio
 
+// RP2350 PIO GPIO windowing: GPIO base (0 or 16) for input_sync_bypass register,
+// which uses PIO-local pin offsets. All SDK sm_config/pio_sm_ functions take
+// absolute GPIO numbers and handle the base subtraction internally.
+#define SDIO_PIO_BASE ((SDIO_D0 >= 16) ? 16u : 0u)
+
 
 // Force everything to idle state
 static sdio_status_t rp2040_sdio_stop();
@@ -739,7 +744,7 @@ static sdio_status_t rp2040_sdio_stop(sd_card_t *sd_card_p)
     }
 
     pio_sm_set_enabled(SDIO_PIO, SDIO_DATA_SM, false);
-    pio_sm_set_consecutive_pindirs(SDIO_PIO, SDIO_DATA_SM, SDIO_D0, 4, false);    
+    pio_sm_set_consecutive_pindirs(SDIO_PIO, SDIO_DATA_SM, SDIO_D0, 4, false);
     STATE.transfer_state = SDIO_IDLE;
     return SDIO_OK;
 }
@@ -778,7 +783,13 @@ bool rp2040_sdio_init(sd_card_t *sd_card_p, float clk_div) {
     // Load PIO programs
     pio_clear_instruction_memory(SDIO_PIO);
 
+    // RP2350 GPIO windowing: set PIO GPIO base so high GPIOs (>31) are visible.
+    // Valid values: 0 (pins 0-31) or 16 (pins 16-47).
+    pio_set_gpio_base(SDIO_PIO, SDIO_PIO_BASE);
+
     // Command & clock state machine
+    // All sm_config/pio_sm_ functions take absolute GPIO numbers (0-47).
+    // The SDK subtracts the GPIO base internally (PICO_PIO_USE_GPIO_BASE=1).
     STATE.pio_cmd_clk_offset = pio_add_program(SDIO_PIO, &sdio_cmd_clk_program);
     pio_sm_config cfg = sdio_cmd_clk_program_get_default_config(STATE.pio_cmd_clk_offset);
     sm_config_set_out_pins(&cfg, SDIO_CMD, 1);
@@ -813,11 +824,11 @@ bool rp2040_sdio_init(sd_card_t *sd_card_p, float clk_div) {
     sm_config_set_out_shift(&STATE.pio_cfg_data_tx, false, true, 32);
     sm_config_set_clkdiv(&STATE.pio_cfg_data_tx, clk_div);
 
-    // Disable SDIO pins input synchronizer.
-    // This reduces input delay.
-    // Because the CLK is driven synchronously to CPU clock,
-    // there should be no metastability problems.
-    SDIO_PIO->input_sync_bypass |= (1 << SDIO_CLK) | (1 << SDIO_CMD) | (1 << SDIO_D0) | (1 << SDIO_D1) | (1 << SDIO_D2) | (1 << SDIO_D3);
+    // Disable SDIO pins input synchronizer — uses PIO-local offsets (direct register access)
+    {
+        uint base = pio_get_gpio_base(SDIO_PIO);
+        SDIO_PIO->input_sync_bypass |= (1 << (SDIO_CLK - base)) | (1 << (SDIO_CMD - base)) | (1 << (SDIO_D0 - base)) | (1 << (SDIO_D1 - base)) | (1 << (SDIO_D2 - base)) | (1 << (SDIO_D3 - base));
+    }
 
     // Redirect GPIOs to PIO
 #if PICO_SDK_VERSION_MAJOR < 2

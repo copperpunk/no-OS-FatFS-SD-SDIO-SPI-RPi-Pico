@@ -228,10 +228,11 @@ uint32_t sd_sdio_errorLine(sd_card_t *sd_card_p) // const
     return STATE.error_line;
 }
 
-bool sd_sdio_isBusy(sd_card_t *sd_card_p) 
+bool sd_sdio_isBusy(sd_card_t *sd_card_p)
 {
-    // return (sio_hw->gpio_in & (1 << SDIO_D0)) == 0;
-    return (sio_hw->gpio_in & (1 << sd_card_p->sdio_if_p->D0_gpio)) == 0;
+    // RP2350 fix: gpio_get() handles GPIOs 32-47 via gpio_hi_in register.
+    // Original sio_hw->gpio_in only covers GPIOs 0-31.
+    return !gpio_get(sd_card_p->sdio_if_p->D0_gpio);
 }
 
 bool sd_sdio_readOCR(sd_card_t *sd_card_p, uint32_t* ocr)
@@ -647,7 +648,14 @@ void sd_sdio_ctor(sd_card_t *sd_card_p) {
     myASSERT(!sd_card_p->sdio_if_p->D2_gpio);
     myASSERT(!sd_card_p->sdio_if_p->D3_gpio);
 
-    sd_card_p->sdio_if_p->CLK_gpio = (sd_card_p->sdio_if_p->D0_gpio + SDIO_CLK_PIN_D0_OFFSET) % 32;
+    // RP2350 fix: compute CLK offset in PIO-local 32-pin window, then add base back.
+    // Original `% 32` wraps incorrectly for GPIOs >= 32 (e.g. D0=36 → CLK=2 instead of 34).
+    {
+        uint d0 = sd_card_p->sdio_if_p->D0_gpio;
+        uint pio_base = (d0 >= 16) ? 16 : 0;
+        uint clk_local = ((d0 - pio_base) + SDIO_CLK_PIN_D0_OFFSET) % 32;
+        sd_card_p->sdio_if_p->CLK_gpio = pio_base + clk_local;
+    }
     sd_card_p->sdio_if_p->D1_gpio = sd_card_p->sdio_if_p->D0_gpio + 1;
     sd_card_p->sdio_if_p->D2_gpio = sd_card_p->sdio_if_p->D0_gpio + 2;
     sd_card_p->sdio_if_p->D3_gpio = sd_card_p->sdio_if_p->D0_gpio + 3;
