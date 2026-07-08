@@ -34,6 +34,20 @@
 
 #define STATE sd_card_p->sdio_if_p->state
 
+// smol: RTOS hook — called while this driver busy-polls DMA/card-busy so
+// equal-priority tasks can run. Weak no-op keeps the library OS-free; the
+// firmware provides a strong definition that yields the calling task.
+__attribute__((weak)) void sd_card_poll_yield(void) {}
+
+// smol: write-retry observability hook; the FC overrides this to report each retry as telemetry.
+__attribute__((weak)) void sd_card_write_retry_notify(uint32_t sector, uint32_t block_count,
+                                                      int attempt, int error) {
+    (void)sector;
+    (void)block_count;
+    (void)attempt;
+    (void)error;
+}
+
 static char const *errstr(sdio_status_t error) {
     switch (error) {
         case SDIO_OK:
@@ -269,9 +283,10 @@ bool sd_sdio_stopTransmission(sd_card_t *sd_card_p, bool blocking)
     else
     {
         uint32_t start = millis();
-        while (millis() - start < 200 && sd_sdio_isBusy(sd_card_p));
+        while (millis() - start < sd_timeouts.sd_sdio_stopTransmission && sd_sdio_isBusy(sd_card_p)) sd_card_poll_yield();
         if (sd_sdio_isBusy(sd_card_p))
         {
+            STATE.error = SDIO_ERR_DATA_TIMEOUT;
             EMSG_PRINTF("sd_sdio_stopTransmission() timeout\n");
             return false;
         }
@@ -316,6 +331,7 @@ bool sd_sdio_writeSector(sd_card_t *sd_card_p, uint32_t sector, const uint8_t* s
     do {
         uint32_t bytes_done;
         STATE.error = rp2040_sdio_tx_poll(sd_card_p, &bytes_done);
+        if (STATE.error == SDIO_BUSY) sd_card_poll_yield();
     } while (STATE.error == SDIO_BUSY);
 
     if (STATE.error != SDIO_OK)
@@ -357,11 +373,15 @@ bool sd_sdio_writeSectors(sd_card_t *sd_card_p, uint32_t sector, const uint8_t *
     do {
         uint32_t bytes_done;
         STATE.error = rp2040_sdio_tx_poll(sd_card_p, &bytes_done);
+        if (STATE.error == SDIO_BUSY) sd_card_poll_yield();
     } while (STATE.error == SDIO_BUSY);
 
     if (STATE.error != SDIO_OK) {
         EMSG_PRINTF("sd_sdio_writeSectors(,%lu,,%zu) failed: %s (%d)\n", sector, n, errstr(STATE.error), (int)STATE.error);
+        // smol: preserve the write's own error across the cleanup, whose CMD12 result clobbers STATE.error
+        sdio_status_t write_error = STATE.error;
         sd_sdio_stopTransmission(sd_card_p, true);
+        STATE.error = write_error;
         return false;
     } else {
         STATE.wr_mlt_blk_cnt_sector = sector + n;
@@ -401,6 +421,7 @@ bool sd_sdio_readSector(sd_card_t *sd_card_p, uint32_t sector, uint8_t* dst)
 
     do {
         STATE.error = rp2040_sdio_rx_poll(sd_card_p, SDIO_WORDS_PER_BLOCK);
+        if (STATE.error == SDIO_BUSY) sd_card_poll_yield();
     } while (STATE.error == SDIO_BUSY);
 
     if (STATE.error != SDIO_OK)
@@ -446,13 +467,17 @@ bool sd_sdio_readSectors(sd_card_t *sd_card_p, uint32_t sector, uint8_t* dst, si
 
     do {
         STATE.error = rp2040_sdio_rx_poll(sd_card_p, SDIO_WORDS_PER_BLOCK);
+        if (STATE.error == SDIO_BUSY) sd_card_poll_yield();
     } while (STATE.error == SDIO_BUSY);
 
     if (STATE.error != SDIO_OK)
     {
-        EMSG_PRINTF("sd_sdio_readSectors(%ld,...,%d)  failed: %s (%d)\n", 
+        EMSG_PRINTF("sd_sdio_readSectors(%ld,...,%d)  failed: %s (%d)\n",
             sector, n, errstr(STATE.error), STATE.error);
+        // smol: preserve the read's own error across the cleanup, whose CMD12 result clobbers STATE.error
+        sdio_status_t read_error = STATE.error;
         sd_sdio_stopTransmission(sd_card_p, true);
+        STATE.error = read_error;
         return false;
     }
     else
@@ -598,10 +623,18 @@ static block_dev_err_t sd_sdio_write_blocks(sd_card_t *sd_card_p, const uint8_t 
 
     sd_lock(sd_card_p);
 
-    if (1 == blockCnt)
-        ok = sd_sdio_writeSector(sd_card_p, ulSectorNumber, buffer);
-    else
-        ok = sd_sdio_writeSectors(sd_card_p, ulSectorNumber, buffer, blockCnt);
+    // smol: a write NACK (e.g. CRC status) is a retransmission request per the SD spec — retry
+    // the block(s) a bounded number of times before reporting failure upward.
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (1 == blockCnt)
+            ok = sd_sdio_writeSector(sd_card_p, ulSectorNumber, buffer);
+        else
+            ok = sd_sdio_writeSectors(sd_card_p, ulSectorNumber, buffer, blockCnt);
+        if (ok)
+            break;
+        sd_card_write_retry_notify(ulSectorNumber, blockCnt, attempt,
+                                   (int)sd_card_p->sdio_if_p->state.error);
+    }
 
     sd_unlock(sd_card_p);
 

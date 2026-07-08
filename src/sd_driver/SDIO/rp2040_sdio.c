@@ -15,6 +15,7 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/sync.h"
 #if PICO_RP2040
 #include "RP2040.h"
 #else
@@ -580,14 +581,28 @@ sdio_status_t rp2040_sdio_tx_start(sd_card_t *sd_card_p, const uint8_t *buffer, 
     // Compute first block checksum
     sdio_compute_next_tx_checksum(sd_card_p);
 
-    // Start first DMA transfer and PIO
-    sdio_start_next_block_tx(sd_card_p);
-
-    if (STATE.blocks_checksumed < STATE.total_blocks)
+    // smol: precompute the second block's checksum into a local BEFORE starting DMA. Upstream
+    // computed it into STATE.next_wr_block_checksum AFTER the start, racing the block-done ISR:
+    // under a preemptive RTOS the task can be held off past block 0's ~70us transmit time, so
+    // the ISR built block 1's end token from a stale/torn checksum and the card NACKed the
+    // block (SDIO_ERR_WRITE_CRC). ZuluSCSI runs bare-metal, where that window is unreachable.
+    uint64_t second_block_checksum = 0;
+    bool has_second_block = num_blocks > 1;
+    if (has_second_block)
     {
-        // Precompute second block checksum
-        sdio_compute_next_tx_checksum(sd_card_p);
+        second_block_checksum = sdio_crc16_4bit_checksum(STATE.data_buf + SDIO_WORDS_PER_BLOCK,
+                                                         SDIO_WORDS_PER_BLOCK);
     }
+
+    // Start first DMA transfer and PIO; publish block 1's checksum before the ISR can run.
+    uint32_t irq_save = save_and_disable_interrupts();
+    sdio_start_next_block_tx(sd_card_p);
+    if (has_second_block)
+    {
+        STATE.next_wr_block_checksum = second_block_checksum;
+        STATE.blocks_checksumed++;
+    }
+    restore_interrupts(irq_save);
 
     return SDIO_OK;
 }
