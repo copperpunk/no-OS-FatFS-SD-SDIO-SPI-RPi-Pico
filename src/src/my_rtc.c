@@ -116,7 +116,7 @@ DWORD get_fattime(void) {
     if (!ok) return 0;
 
     struct tm t;
-    localtime_r(&ts.tv_sec, &t);
+    gmtime_r(&ts.tv_sec, &t);
 
     DWORD fattime = 0;
     // bit31:25
