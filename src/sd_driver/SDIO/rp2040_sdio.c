@@ -178,7 +178,9 @@ sdio_status_t rp2040_sdio_command_R1(sd_card_t *sd_card_p, uint8_t command, uint
     uint32_t wait_words = response ? 2 : 1;
     while (pio_sm_get_rx_fifo_level(SDIO_PIO, SDIO_CMD_SM) < wait_words)
     {
-        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R1)
+        // smol: a waiter preempted past the limit must not time out a response that has arrived.
+        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R1 &&
+            pio_sm_get_rx_fifo_level(SDIO_PIO, SDIO_CMD_SM) < wait_words)
         {
             if (command != 8) // Don't log for missing SD card
             {
@@ -255,7 +257,9 @@ sdio_status_t rp2040_sdio_command_R2(const sd_card_t *sd_card_p, uint8_t command
     uint32_t start = millis();
     while (dma_channel_is_busy(SDIO_DMA_CH))
     {
-        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R2)
+        // smol: a waiter preempted past the limit must not time out a response that has arrived.
+        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R2 &&
+            dma_channel_is_busy(SDIO_DMA_CH))
         {
             azdbg("Timeout waiting for response in rp2040_sdio_command_R2(", (int)command, "), ",
                   "PIO PC: ", (int)pio_sm_get_pc(SDIO_PIO, SDIO_CMD_SM) - (int)STATE.pio_cmd_clk_offset,
@@ -322,7 +326,9 @@ sdio_status_t rp2040_sdio_command_R3(sd_card_t *sd_card_p, uint8_t command, uint
     uint32_t start = millis();
     while (pio_sm_get_rx_fifo_level(SDIO_PIO, SDIO_CMD_SM) < 2)
     {
-        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R3)
+        // smol: a waiter preempted past the limit must not time out a response that has arrived.
+        if ((uint32_t)(millis() - start) > sd_timeouts.rp2040_sdio_command_R3 &&
+            pio_sm_get_rx_fifo_level(SDIO_PIO, SDIO_CMD_SM) < 2)
         {
             azdbg("Timeout waiting for response in rp2040_sdio_command_R3(", (int)command, "), ",
                   "PIO PC: ", (int)pio_sm_get_pc(SDIO_PIO, SDIO_CMD_SM) - (int)STATE.pio_cmd_clk_offset,
